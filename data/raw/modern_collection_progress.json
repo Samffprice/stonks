@@ -1,0 +1,44 @@
+{
+  "AAPL": {
+    "ticker": "AAPL",
+    "start_date": "2024-01-01",
+    "end_date": "2024-01-02",
+    "last_collected_date": "2024-01-02",
+    "total_days": 1,
+    "completed_days": 2,
+    "status": "completed",
+    "error_message": null,
+    "last_updated": "2025-06-26T19:17:09.412301",
+    "underlying_bars_collected": 2,
+    "options_contracts_collected": 1,
+    "options_bars_collected": 1
+  },
+  "GOOGL": {
+    "ticker": "GOOGL",
+    "start_date": "2024-01-01",
+    "end_date": "2024-01-01",
+    "last_collected_date": "2024-01-01",
+    "total_days": 1,
+    "completed_days": 1,
+    "status": "completed",
+    "error_message": null,
+    "last_updated": "2025-06-26T19:16:48.568881",
+    "underlying_bars_collected": 0,
+    "options_contracts_collected": 0,
+    "options_bars_collected": 0
+  },
+  "MSFT": {
+    "ticker": "MSFT",
+    "start_date": "2024-01-01",
+    "end_date": "2024-01-01",
+    "last_collected_date": "2024-01-01",
+    "total_days": 1,
+    "completed_days": 1,
+    "status": "completed",
+    "error_message": null,
+    "last_updated": "2025-06-26T19:16:48.552032",
+    "underlying_bars_collected": 0,
+    "options_contracts_collected": 0,
+    "options_bars_collected": 0
+  }
+}

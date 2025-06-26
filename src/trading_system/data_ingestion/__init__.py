@@ -20,7 +20,12 @@ from .models import (
 from .polygon_client import (
     PolygonClient,
     PolygonAPIError,
-    RateLimiter,
+    RateLimitExceededError,
+    DataType,
+    TimeFrame,
+    OptionsContract as PolygonOptionsContract,
+    OptionsBar,
+    RateLimitInfo as PolygonRateLimitInfo,
 )
 
 from .eod_collector import (
@@ -41,10 +46,15 @@ __all__ = [
     "convert_to_dataframe",
     "validate_ticker_symbol",
     
-    # Client
+    # Polygon Client
     "PolygonClient",
     "PolygonAPIError",
-    "RateLimiter",
+    "RateLimitExceededError",
+    "DataType",
+    "TimeFrame",
+    "PolygonOptionsContract",
+    "OptionsBar",
+    "PolygonRateLimitInfo",
     
     # EOD Collector
     "EODDataCollector",

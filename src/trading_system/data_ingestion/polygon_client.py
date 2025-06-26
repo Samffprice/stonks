@@ -1,416 +1,482 @@
 """
-Polygon.io API client for fetching market data.
+Polygon.io API Client for Options Trading System
 
-This module provides a comprehensive client for interacting with the Polygon.io API,
-including rate limiting, error handling, and data transformation.
+This module provides a robust client for interacting with the Polygon.io API,
+with strict rate limiting (5 calls/minute), comprehensive error handling,
+and data validation for options data retrieval.
 """
 
 import time
-from datetime import datetime, date, timedelta
-from decimal import Decimal
-from typing import List, Optional, Dict, Any, Union
-import requests
+import asyncio
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass, asdict
 import logging
+from enum import Enum
+
+import requests
+import pandas as pd
+from polygon import RESTClient
 
 from ..config.settings import Config
 from ..utils.logger import get_logger
-from .models import (
-    OHLCVData, NewsArticle, OptionsContract, TechnicalIndicator,
-    APIResponse, RateLimitInfo, validate_ticker_symbol
-)
+
+
+class DataType(Enum):
+    """Supported data types for polygon API"""
+    TRADES = "trades"
+    QUOTES = "quotes"
+    BARS = "bars"
+    OPTIONS_CONTRACTS = "options_contracts"
+    DAILY_BARS = "daily_bars"
+
+
+class TimeFrame(Enum):
+    """Supported timeframes for historical data"""
+    MINUTE = "minute"
+    HOUR = "hour"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+
+
+@dataclass
+class OptionsContract:
+    """Options contract data structure"""
+    ticker: str
+    underlying_ticker: str
+    contract_type: str  # 'call' or 'put'
+    expiration_date: str
+    strike_price: float
+    exercise_style: str
+    shares_per_contract: int
+    primary_exchange: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
+class OptionsBar:
+    """Options bar data structure"""
+    ticker: str
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    vwap: Optional[float] = None
+    transactions: Optional[int] = None
+
+
+@dataclass
+class RateLimitInfo:
+    """Rate limit tracking information"""
+    calls_made: int = 0
+    window_start: float = 0.0
+    last_call_time: float = 0.0
 
 
 class PolygonAPIError(Exception):
-    """Custom exception for Polygon API errors."""
-    
-    def __init__(self, message: str, status_code: Optional[int] = None, response_data: Optional[Dict] = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_data = response_data
+    """Custom exception for Polygon API errors"""
+    pass
 
 
-class RateLimiter:
-    """Rate limiter for API calls."""
-    
-    def __init__(self, calls_per_minute: int = 5):
-        self.calls_per_minute = calls_per_minute
-        self.call_times: List[float] = []
-        self.logger = get_logger('api.ratelimiter')
-    
-    def wait_if_needed(self) -> None:
-        """Wait if necessary to respect rate limits."""
-        now = time.time()
-        
-        # Remove calls older than 1 minute
-        cutoff_time = now - 60
-        self.call_times = [t for t in self.call_times if t > cutoff_time]
-        
-        # Check if we need to wait
-        if len(self.call_times) >= self.calls_per_minute:
-            wait_time = 60 - (now - self.call_times[0]) + 1  # Add 1 second buffer
-            self.logger.info(f"Rate limit reached. Waiting {wait_time:.1f} seconds")
-            time.sleep(wait_time)
-            
-            # Clean up old calls again after waiting
-            now = time.time()
-            cutoff_time = now - 60
-            self.call_times = [t for t in self.call_times if t > cutoff_time]
-    
-    def record_call(self) -> None:
-        """Record that an API call was made."""
-        self.call_times.append(time.time())
-    
-    def get_info(self) -> RateLimitInfo:
-        """Get current rate limit information."""
-        now = time.time()
-        cutoff_time = now - 60
-        recent_calls = [t for t in self.call_times if t > cutoff_time]
-        
-        calls_remaining = max(0, self.calls_per_minute - len(recent_calls))
-        reset_time = datetime.utcnow()
-        
-        if recent_calls:
-            reset_time = datetime.fromtimestamp(recent_calls[0] + 60)
-        
-        return RateLimitInfo(
-            calls_remaining=calls_remaining,
-            reset_time=reset_time,
-            calls_per_minute=self.calls_per_minute
-        )
+class RateLimitExceededError(PolygonAPIError):
+    """Exception raised when rate limit is exceeded"""
+    pass
 
 
 class PolygonClient:
-    """Polygon.io API client with rate limiting and error handling."""
+    """
+    Polygon.io API client with rate limiting and error handling
     
-    def __init__(self, config: Optional[Config] = None):
-        self.config = config or Config()
-        self.api_key = self.config.api.polygon_api_key
-        self.base_url = "https://api.polygon.io"
-        self.rate_limiter = RateLimiter(self.config.api.polygon_rate_limit)
-        self.logger = get_logger('api.polygon')
-        
-        # Set up session for HTTP connections
-        self.session = requests.Session()
-        self.max_retries = self.config.api.polygon_max_retries
-        
-        if not self.api_key:
-            raise ValueError("Polygon API key is required")
+    Features:
+    - Rate limiting: 5 calls per minute with 13-second minimum delays
+    - Automatic retry with exponential backoff
+    - Comprehensive error handling
+    - Data validation and transformation
+    - Logging for monitoring and debugging
+    """
     
-    def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> APIResponse:
-        """Make a rate-limited request to the Polygon API with retries."""
-        # Wait for rate limiting
-        self.rate_limiter.wait_if_needed()
+    def __init__(self, config: Config):
+        """
+        Initialize the Polygon client
         
-        # Prepare request
-        url = f"{self.base_url}{endpoint}"
-        request_params = {"apikey": self.api_key}
-        if params:
-            request_params.update(params)
+        Args:
+            config: Application configuration containing API credentials
+        """
+        self.config = config
+        self.logger = get_logger(f"{__name__}.PolygonClient")
         
-        last_exception = None
-        for attempt in range(self.max_retries + 1):
+        # Rate limiting configuration (5 calls per minute)
+        self.max_calls_per_minute = 5
+        self.min_delay_seconds = 13  # 60/5 + buffer = 13 seconds
+        self.rate_limit = RateLimitInfo()
+        
+        # Initialize REST client
+        try:
+            self.client = RESTClient(api_key=config.api.polygon_api_key)
+            self.logger.info("Polygon client initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Polygon client: {e}")
+            raise PolygonAPIError(f"Client initialization failed: {e}")
+    
+    def _check_rate_limit(self) -> None:
+        """
+        Check and enforce rate limiting
+        
+        Raises:
+            RateLimitExceededError: If rate limit would be exceeded
+        """
+        current_time = time.time()
+        
+        # Reset window if more than 60 seconds have passed
+        if current_time - self.rate_limit.window_start >= 60:
+            self.rate_limit.calls_made = 0
+            self.rate_limit.window_start = current_time
+        
+        # Check if we've exceeded the rate limit
+        if self.rate_limit.calls_made >= self.max_calls_per_minute:
+            wait_time = 60 - (current_time - self.rate_limit.window_start)
+            if wait_time > 0:
+                self.logger.warning(f"Rate limit reached. Waiting {wait_time:.2f} seconds")
+                time.sleep(wait_time)
+                # Reset after waiting
+                self.rate_limit.calls_made = 0
+                self.rate_limit.window_start = time.time()
+        
+        # Enforce minimum delay between calls
+        time_since_last_call = current_time - self.rate_limit.last_call_time
+        if time_since_last_call < self.min_delay_seconds:
+            wait_time = self.min_delay_seconds - time_since_last_call
+            self.logger.debug(f"Enforcing minimum delay. Waiting {wait_time:.2f} seconds")
+            time.sleep(wait_time)
+    
+    def _make_api_call(self, func, *args, **kwargs) -> Any:
+        """
+        Make an API call with rate limiting and error handling
+        
+        Args:
+            func: API function to call
+            *args: Positional arguments for the function
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            API response data
+            
+        Raises:
+            PolygonAPIError: If API call fails after retries
+        """
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
             try:
-                self.logger.debug(f"Making request to {endpoint} with params: {params} (attempt {attempt + 1})")
-                response = self.session.get(url, params=request_params, timeout=30)
-                self.rate_limiter.record_call()
+                # Enforce rate limiting
+                self._check_rate_limit()
                 
-                # Handle response
-                if response.status_code == 200:
-                    data = response.json()
-                    return APIResponse(
-                        status=data.get("status", "OK"),
-                        request_id=data.get("request_id"),
-                        next_url=data.get("next_url"),
-                        count=data.get("count"),
-                        results=data.get("results", [])
-                    )
-                elif response.status_code in [429, 500, 502, 503, 504] and attempt < self.max_retries:
-                    # Retry on server errors and rate limits
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    self.logger.warning(f"Request failed with status {response.status_code}, retrying in {wait_time}s")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    error_msg = f"API request failed with status {response.status_code}"
-                    try:
-                        error_data = response.json()
-                        error_msg += f": {error_data.get('error', 'Unknown error')}"
-                    except:
-                        error_msg += f": {response.text}"
-                    
-                    raise PolygonAPIError(error_msg, response.status_code)
-                    
-            except requests.exceptions.RequestException as e:
-                last_exception = e
-                if attempt < self.max_retries:
-                    wait_time = 2 ** attempt
-                    self.logger.warning(f"Request failed: {str(e)}, retrying in {wait_time}s")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise PolygonAPIError(f"Request failed after {self.max_retries} retries: {str(e)}")
-        
-        # Should not reach here, but just in case
-        raise PolygonAPIError(f"Request failed after {self.max_retries} retries: {str(last_exception)}")
-    
-    def get_stock_bars(
-        self,
-        symbol: str,
-        start_date: Union[str, date],
-        end_date: Union[str, date],
-        timespan: str = "day",
-        multiplier: int = 1,
-        limit: int = 5000
-    ) -> List[OHLCVData]:
-        """
-        Get OHLCV bars for a stock.
-        
-        Args:
-            symbol: Stock symbol
-            start_date: Start date (YYYY-MM-DD format or date object)
-            end_date: End date (YYYY-MM-DD format or date object)
-            timespan: Timespan (minute, hour, day, week, month, quarter, year)
-            multiplier: Multiplier for timespan
-            limit: Maximum number of results
-        
-        Returns:
-            List of OHLCVData objects
-        """
-        symbol = validate_ticker_symbol(symbol)
-        
-        # Convert dates to strings if needed
-        if isinstance(start_date, date):
-            start_date = start_date.strftime("%Y-%m-%d")
-        if isinstance(end_date, date):
-            end_date = end_date.strftime("%Y-%m-%d")
-        
-        endpoint = f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{start_date}/{end_date}"
-        params = {
-            "adjusted": "true",
-            "sort": "asc",
-            "limit": limit
-        }
-        
-        response = self._make_request(endpoint, params)
-        bars = []
-        
-        for result in response.results:
-            try:
-                bar = OHLCVData(
-                    symbol=symbol,
-                    timestamp=datetime.fromtimestamp(result["t"] / 1000),
-                    open=Decimal(str(result["o"])),
-                    high=Decimal(str(result["h"])),
-                    low=Decimal(str(result["l"])),
-                    close=Decimal(str(result["c"])),
-                    volume=int(result["v"]),
-                    vwap=Decimal(str(result.get("vw", 0))) if result.get("vw") else None
-                )
-                bars.append(bar)
-            except (KeyError, ValueError) as e:
-                self.logger.warning(f"Failed to parse bar data for {symbol}: {e}")
-                continue
-        
-        self.logger.info(f"Retrieved {len(bars)} bars for {symbol}")
-        return bars
-    
-    def get_news(
-        self,
-        symbol: Optional[str] = None,
-        start_date: Optional[Union[str, date]] = None,
-        end_date: Optional[Union[str, date]] = None,
-        limit: int = 1000
-    ) -> List[NewsArticle]:
-        """
-        Get news articles.
-        
-        Args:
-            symbol: Optional stock symbol to filter by
-            start_date: Start date for news articles
-            end_date: End date for news articles  
-            limit: Maximum number of articles
-        
-        Returns:
-            List of NewsArticle objects
-        """
-        endpoint = "/v2/reference/news"
-        params = {"limit": limit, "sort": "published_utc"}
-        
-        if symbol:
-            symbol = validate_ticker_symbol(symbol)
-            params["ticker"] = symbol
-        
-        if start_date:
-            if isinstance(start_date, date):
-                start_date = start_date.strftime("%Y-%m-%d")
-            params["published_utc.gte"] = start_date
-        
-        if end_date:
-            if isinstance(end_date, date):
-                end_date = end_date.strftime("%Y-%m-%d")
-            params["published_utc.lte"] = end_date
-        
-        response = self._make_request(endpoint, params)
-        articles = []
-        
-        for result in response.results:
-            try:
-                article = NewsArticle(
-                    id=result["id"],
-                    title=result["title"],
-                    description=result.get("description"),
-                    author=result.get("author"),
-                    published_utc=datetime.fromisoformat(result["published_utc"].replace("Z", "+00:00")),
-                    article_url=result.get("article_url"),
-                    tickers=result.get("tickers", []),
-                    keywords=result.get("keywords", [])
-                )
-                articles.append(article)
-            except (KeyError, ValueError) as e:
-                self.logger.warning(f"Failed to parse news article: {e}")
-                continue
-        
-        self.logger.info(f"Retrieved {len(articles)} news articles")
-        return articles
+                # Make the API call
+                func_name = getattr(func, '__name__', str(func))
+                self.logger.debug(f"Making API call: {func_name} (attempt {attempt + 1})")
+                response = func(*args, **kwargs)
+                
+                # Update rate limit tracking
+                self.rate_limit.calls_made += 1
+                self.rate_limit.last_call_time = time.time()
+                
+                self.logger.debug(f"API call successful: {func_name}")
+                return response
+                
+            except Exception as e:
+                self.logger.warning(f"API call failed (attempt {attempt + 1}): {e}")
+                
+                if attempt == max_retries - 1:
+                    func_name = getattr(func, '__name__', str(func))
+                    self.logger.error(f"All retry attempts failed for {func_name}")
+                    raise PolygonAPIError(f"API call failed after {max_retries} attempts: {e}")
+                
+                # Exponential backoff
+                delay = base_delay * (2 ** attempt)
+                self.logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
     
     def get_options_contracts(
         self,
-        underlying_symbol: str,
-        expiration_date: Optional[Union[str, date]] = None,
-        strike_price: Optional[float] = None,
-        option_type: Optional[str] = None,
+        underlying_ticker: str,
+        expiration_date: Optional[str] = None,
+        contract_type: Optional[str] = None,
+        strike_price_gte: Optional[float] = None,
+        strike_price_lte: Optional[float] = None,
+        expired: bool = False,
         limit: int = 1000
     ) -> List[OptionsContract]:
         """
-        Get options contracts for an underlying symbol.
+        Get options contracts for an underlying ticker
         
         Args:
-            underlying_symbol: Underlying stock symbol
-            expiration_date: Optional expiration date to filter by
-            strike_price: Optional strike price to filter by
-            option_type: Optional option type ('call' or 'put')
-            limit: Maximum number of contracts
-        
+            underlying_ticker: The underlying stock ticker
+            expiration_date: Expiration date in YYYY-MM-DD format
+            contract_type: 'call' or 'put'
+            strike_price_gte: Minimum strike price
+            strike_price_lte: Maximum strike price
+            expired: Include expired contracts
+            limit: Maximum number of contracts to return
+            
         Returns:
-            List of OptionsContract objects
+            List of options contracts
         """
-        underlying_symbol = validate_ticker_symbol(underlying_symbol)
+        self.logger.info(f"Fetching options contracts for {underlying_ticker}")
         
-        endpoint = "/v3/reference/options/contracts"
-        params = {
-            "underlying_ticker": underlying_symbol,
-            "limit": limit,
-            "sort": "expiration_date"
-        }
-        
-        if expiration_date:
-            if isinstance(expiration_date, date):
-                expiration_date = expiration_date.strftime("%Y-%m-%d")
-            params["expiration_date"] = expiration_date
-        
-        if strike_price:
-            params["strike_price"] = strike_price
-        
-        if option_type:
-            if option_type.lower() not in ['call', 'put']:
-                raise ValueError("option_type must be 'call' or 'put'")
-            params["contract_type"] = option_type.lower()
-        
-        response = self._make_request(endpoint, params)
-        contracts = []
-        
-        for result in response.results:
-            try:
-                contract = OptionsContract(
-                    contract_symbol=result["ticker"],
-                    underlying_ticker=result["underlying_ticker"],
-                    strike_price=Decimal(str(result["strike_price"])),
-                    expiration_date=datetime.strptime(result["expiration_date"], "%Y-%m-%d").date(),
-                    option_type=result["contract_type"]
-                )
-                contracts.append(contract)
-            except (KeyError, ValueError) as e:
-                self.logger.warning(f"Failed to parse options contract: {e}")
-                continue
-        
-        self.logger.info(f"Retrieved {len(contracts)} options contracts for {underlying_symbol}")
-        return contracts
-    
-    def get_technical_indicators(
-        self,
-        symbol: str,
-        indicator_name: str,
-        start_date: Union[str, date],
-        end_date: Union[str, date],
-        timespan: str = "day",
-        period: int = 50,
-        limit: int = 5000
-    ) -> List[TechnicalIndicator]:
-        """
-        Get technical indicators for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            indicator_name: Technical indicator name (sma, ema, rsi, etc.)
-            start_date: Start date
-            end_date: End date
-            timespan: Timespan for calculation
-            period: Period for indicator calculation
-            limit: Maximum number of results
-        
-        Returns:
-            List of TechnicalIndicator objects
-        """
-        symbol = validate_ticker_symbol(symbol)
-        
-        # Convert dates to strings if needed
-        if isinstance(start_date, date):
-            start_date = start_date.strftime("%Y-%m-%d")
-        if isinstance(end_date, date):
-            end_date = end_date.strftime("%Y-%m-%d")
-        
-        endpoint = f"/v1/indicators/{indicator_name}/{symbol}"
-        params = {
-            "timestamp.gte": start_date,
-            "timestamp.lte": end_date,
-            "timespan": timespan,
-            f"{indicator_name}.window": period,
-            "limit": limit,
-            "order": "asc"
-        }
-        
-        response = self._make_request(endpoint, params)
-        indicators = []
-        
-        for result in response.results:
-            try:
-                indicator = TechnicalIndicator(
-                    symbol=symbol,
-                    timestamp=datetime.fromtimestamp(result["timestamp"] / 1000),
-                    indicator_name=indicator_name,
-                    value=float(result.get("value", result.get(indicator_name, {}).get("value", 0))),
-                    period=period
-                )
-                indicators.append(indicator)
-            except (KeyError, ValueError) as e:
-                self.logger.warning(f"Failed to parse technical indicator: {e}")
-                continue
-        
-        self.logger.info(f"Retrieved {len(indicators)} {indicator_name} indicators for {symbol}")
-        return indicators
-    
-    def get_rate_limit_info(self) -> RateLimitInfo:
-        """Get current rate limit information."""
-        return self.rate_limiter.get_info()
-    
-    def health_check(self) -> bool:
-        """Perform a health check on the API connection."""
         try:
-            # Make a simple request to check connectivity
-            endpoint = "/v2/reference/tickers"
-            params = {"limit": 1}
-            response = self._make_request(endpoint, params)
-            return response.status == "OK"
+            response = self._make_api_call(
+                self.client.list_options_contracts,
+                underlying_ticker=underlying_ticker,
+                expiration_date=expiration_date,
+                contract_type=contract_type,
+                strike_price_gte=strike_price_gte,
+                strike_price_lte=strike_price_lte,
+                expired=expired,
+                limit=limit
+            )
+            
+            contracts = []
+            if hasattr(response, 'results') and response.results:
+                for contract_data in response.results:
+                    contract = OptionsContract(
+                        ticker=getattr(contract_data, 'ticker', ''),
+                        underlying_ticker=getattr(contract_data, 'underlying_ticker', underlying_ticker),
+                        contract_type=getattr(contract_data, 'contract_type', ''),
+                        expiration_date=getattr(contract_data, 'expiration_date', ''),
+                        strike_price=getattr(contract_data, 'strike_price', 0.0),
+                        exercise_style=getattr(contract_data, 'exercise_style', ''),
+                        shares_per_contract=getattr(contract_data, 'shares_per_contract', 100),
+                        primary_exchange=getattr(contract_data, 'primary_exchange', ''),
+                        created_at=getattr(contract_data, 'created_at', None),
+                        updated_at=getattr(contract_data, 'updated_at', None)
+                    )
+                    contracts.append(contract)
+            
+            self.logger.info(f"Retrieved {len(contracts)} options contracts for {underlying_ticker}")
+            return contracts
+            
         except Exception as e:
-            self.logger.error(f"Health check failed: {e}")
+            self.logger.error(f"Failed to get options contracts for {underlying_ticker}: {e}")
+            raise PolygonAPIError(f"Failed to get options contracts: {e}")
+    
+    def get_options_bars(
+        self,
+        options_ticker: str,
+        timespan: TimeFrame,
+        from_date: str,
+        to_date: str,
+        adjusted: bool = True,
+        sort: str = "asc",
+        limit: int = 5000
+    ) -> List[OptionsBar]:
+        """
+        Get historical bars for an options contract
+        
+        Args:
+            options_ticker: The options ticker symbol
+            timespan: Timeframe for the bars
+            from_date: Start date in YYYY-MM-DD format
+            to_date: End date in YYYY-MM-DD format
+            adjusted: Whether to return adjusted data
+            sort: Sort order ('asc' or 'desc')
+            limit: Maximum number of bars to return
+            
+        Returns:
+            List of options bars
+        """
+        self.logger.info(f"Fetching options bars for {options_ticker} from {from_date} to {to_date}")
+        
+        try:
+            response = self._make_api_call(
+                self.client.get_aggs,
+                ticker=options_ticker,
+                multiplier=1,
+                timespan=timespan.value,
+                from_=from_date,
+                to=to_date,
+                adjusted=adjusted,
+                sort=sort,
+                limit=limit
+            )
+            
+            bars = []
+            if hasattr(response, 'results') and response.results:
+                for bar_data in response.results:
+                    bar = OptionsBar(
+                        ticker=options_ticker,
+                        timestamp=getattr(bar_data, 't', 0),
+                        open=getattr(bar_data, 'o', 0.0),
+                        high=getattr(bar_data, 'h', 0.0),
+                        low=getattr(bar_data, 'l', 0.0),
+                        close=getattr(bar_data, 'c', 0.0),
+                        volume=getattr(bar_data, 'v', 0),
+                        vwap=getattr(bar_data, 'vw', None),
+                        transactions=getattr(bar_data, 'n', None)
+                    )
+                    bars.append(bar)
+            
+            self.logger.info(f"Retrieved {len(bars)} bars for {options_ticker}")
+            return bars
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get options bars for {options_ticker}: {e}")
+            raise PolygonAPIError(f"Failed to get options bars: {e}")
+    
+    def get_underlying_bars(
+        self,
+        ticker: str,
+        timespan: TimeFrame,
+        from_date: str,
+        to_date: str,
+        adjusted: bool = True,
+        sort: str = "asc",
+        limit: int = 5000
+    ) -> pd.DataFrame:
+        """
+        Get historical bars for the underlying stock
+        
+        Args:
+            ticker: The stock ticker symbol
+            timespan: Timeframe for the bars
+            from_date: Start date in YYYY-MM-DD format
+            to_date: End date in YYYY-MM-DD format
+            adjusted: Whether to return adjusted data
+            sort: Sort order ('asc' or 'desc')
+            limit: Maximum number of bars to return
+            
+        Returns:
+            DataFrame with OHLCV data
+        """
+        self.logger.info(f"Fetching underlying bars for {ticker} from {from_date} to {to_date}")
+        
+        try:
+            response = self._make_api_call(
+                self.client.get_aggs,
+                ticker=ticker,
+                multiplier=1,
+                timespan=timespan.value,
+                from_=from_date,
+                to=to_date,
+                adjusted=adjusted,
+                sort=sort,
+                limit=limit
+            )
+            
+            data = []
+            if hasattr(response, 'results') and response.results:
+                for bar in response.results:
+                    data.append({
+                        'timestamp': getattr(bar, 't', 0),
+                        'open': getattr(bar, 'o', 0.0),
+                        'high': getattr(bar, 'h', 0.0),
+                        'low': getattr(bar, 'l', 0.0),
+                        'close': getattr(bar, 'c', 0.0),
+                        'volume': getattr(bar, 'v', 0),
+                        'vwap': getattr(bar, 'vw', None),
+                        'transactions': getattr(bar, 'n', None)
+                    })
+            
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+            
+            self.logger.info(f"Retrieved {len(df)} bars for {ticker}")
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get underlying bars for {ticker}: {e}")
+            raise PolygonAPIError(f"Failed to get underlying bars: {e}")
+    
+    def get_market_status(self) -> Dict[str, Any]:
+        """
+        Get current market status
+        
+        Returns:
+            Dictionary containing market status information
+        """
+        self.logger.debug("Fetching market status")
+        
+        try:
+            response = self._make_api_call(self.client.get_market_status)
+            
+            status = {
+                'market': getattr(response, 'market', 'unknown'),
+                'server_time': getattr(response, 'serverTime', ''),
+                'exchanges': {}
+            }
+            
+            if hasattr(response, 'exchanges'):
+                for exchange_name, exchange_data in response.exchanges.items():
+                    status['exchanges'][exchange_name] = {
+                        'status': getattr(exchange_data, 'status', 'unknown'),
+                        'session': getattr(exchange_data, 'session', 'unknown')
+                    }
+            
+            self.logger.debug("Market status retrieved successfully")
+            return status
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get market status: {e}")
+            raise PolygonAPIError(f"Failed to get market status: {e}")
+    
+    def validate_ticker(self, ticker: str) -> bool:
+        """
+        Validate that a ticker exists and is tradeable
+        
+        Args:
+            ticker: The ticker symbol to validate
+            
+        Returns:
+            True if ticker is valid, False otherwise
+        """
+        self.logger.debug(f"Validating ticker: {ticker}")
+        
+        try:
+            # Try to get recent data for the ticker
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            
+            response = self._make_api_call(
+                self.client.get_aggs,
+                ticker=ticker,
+                multiplier=1,
+                timespan='day',
+                from_=start_date,
+                to=end_date,
+                limit=1
+            )
+            
+            is_valid = hasattr(response, 'results') and response.results is not None
+            self.logger.debug(f"Ticker {ticker} validation result: {is_valid}")
+            return is_valid
+            
+        except Exception as e:
+            self.logger.warning(f"Ticker validation failed for {ticker}: {e}")
             return False
+    
+    def get_rate_limit_status(self) -> Dict[str, Any]:
+        """
+        Get current rate limit status
+        
+        Returns:
+            Dictionary with rate limit information
+        """
+        current_time = time.time()
+        time_in_window = current_time - self.rate_limit.window_start
+        calls_remaining = max(0, self.max_calls_per_minute - self.rate_limit.calls_made)
+        time_until_reset = max(0, 60 - time_in_window)
+        
+        return {
+            'calls_made': self.rate_limit.calls_made,
+            'calls_remaining': calls_remaining,
+            'window_start': self.rate_limit.window_start,
+            'time_in_window': time_in_window,
+            'time_until_reset': time_until_reset,
+            'last_call_time': self.rate_limit.last_call_time
+        }

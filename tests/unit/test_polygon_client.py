@@ -1,364 +1,484 @@
 """
-Unit tests for Polygon API client.
+Unit tests for Polygon.io API client
 
-Tests the PolygonClient functionality including rate limiting,
-error handling, and data retrieval methods.
+Tests cover:
+- Rate limiting functionality
+- API call error handling and retries
+- Data validation and transformation
+- Configuration validation
+- Market status retrieval
 """
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime, date, timedelta
 import time
+from unittest.mock import Mock, patch, MagicMock
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+
+# Skip if dependencies not available
+pytest = pytest.importorskip("pytest")
 
 try:
     from src.trading_system.data_ingestion.polygon_client import (
-        PolygonClient, PolygonAPIError, RateLimiter
+        PolygonClient,
+        PolygonAPIError,
+        RateLimitExceededError,
+        DataType,
+        TimeFrame,
+        OptionsContract,
+        OptionsBar,
+        RateLimitInfo
     )
-    from src.trading_system.data_ingestion.models import (
-        APIResponse, OHLCVData, NewsArticle, OptionsContract, TechnicalIndicator
+    from src.trading_system.config.config import Config, APIConfig, DataConfig, TradingConfig, MLConfig, LoggingConfig
+except ImportError as e:
+    pytest.skip(f"Dependencies not available: {e}", allow_module_level=True)
+
+
+@pytest.fixture
+def mock_config():
+    """Create a mock configuration for testing"""
+    return Config(
+        api=APIConfig(
+            polygon_api_key="test_api_key_12345",
+            polygon_rate_limit=5,
+            polygon_max_retries=3
+        ),
+        data=DataConfig(),
+        trading=TradingConfig(),
+        ml=MLConfig(),
+        logging=LoggingConfig()
     )
-    from src.trading_system.config.settings import Config
-    CLIENT_AVAILABLE = True
-except ImportError:
-    CLIENT_AVAILABLE = False
 
 
-@pytest.mark.skipif(not CLIENT_AVAILABLE, reason="Polygon client not available")
-class TestRateLimiter:
-    """Test rate limiter functionality."""
-    
-    def test_rate_limiter_creation(self):
-        """Test creating rate limiter."""
-        limiter = RateLimiter(calls_per_minute=5)
-        assert limiter.calls_per_minute == 5
-        assert len(limiter.call_times) == 0
-    
-    def test_rate_limiter_under_limit(self):
-        """Test rate limiter when under limit."""
-        limiter = RateLimiter(calls_per_minute=5)
-        
-        # Should not wait when under limit
-        start_time = time.time()
-        limiter.wait_if_needed()
-        end_time = time.time()
-        
-        # Should complete quickly
-        assert end_time - start_time < 0.1
-        
-        # Record call
-        limiter.record_call()
-        assert len(limiter.call_times) == 1
-    
-    def test_rate_limiter_at_limit(self):
-        """Test rate limiter when at limit."""
-        limiter = RateLimiter(calls_per_minute=2)  # Low limit for testing
-        
-        # Fill up the rate limit
-        for _ in range(2):
-            limiter.record_call()
-        
-        # Mock time to avoid actually waiting
-        with patch('time.sleep') as mock_sleep:
-            with patch('time.time', side_effect=[60, 60, 120]):  # Simulate time passage
-                limiter.wait_if_needed()
-                mock_sleep.assert_called()
-    
-    def test_rate_limit_info(self):
-        """Test rate limit information."""
-        limiter = RateLimiter(calls_per_minute=5)
-        
-        # No calls made yet
-        info = limiter.get_info()
-        assert info.calls_remaining == 5
-        
-        # Make some calls
-        limiter.record_call()
-        limiter.record_call()
-        
-        info = limiter.get_info()
-        assert info.calls_remaining == 3
+@pytest.fixture
+def mock_polygon_rest_client():
+    """Create a mock Polygon REST client"""
+    with patch('src.trading_system.data_ingestion.polygon_client.RESTClient') as mock_client_class:
+        mock_client = Mock()
+        mock_client_class.return_value = mock_client
+        yield mock_client
 
 
-@pytest.mark.skipif(not CLIENT_AVAILABLE, reason="Polygon client not available")
-class TestPolygonClient:
-    """Test Polygon API client."""
+@pytest.fixture
+def polygon_client(mock_config, mock_polygon_rest_client):
+    """Create a PolygonClient instance for testing"""
+    return PolygonClient(mock_config)
+
+
+class TestPolygonClientInitialization:
+    """Test Polygon client initialization"""
     
-    @pytest.fixture
-    def mock_config(self):
-        """Create mock configuration."""
-        config = Mock(spec=Config)
-        config.api = Mock()
-        config.api.polygon_api_key = "test_api_key"
-        config.api.polygon_rate_limit = 5
-        config.api.polygon_max_retries = 3
-        return config
-    
-    @pytest.fixture
-    def client(self, mock_config):
-        """Create Polygon client with mock config."""
-        return PolygonClient(mock_config)
-    
-    def test_client_creation(self, mock_config):
-        """Test creating Polygon client."""
+    def test_successful_initialization(self, mock_config, mock_polygon_rest_client):
+        """Test successful client initialization"""
         client = PolygonClient(mock_config)
-        assert client.api_key == "test_api_key"
-        assert client.base_url == "https://api.polygon.io"
-        assert client.rate_limiter.calls_per_minute == 5
-    
-    def test_client_requires_api_key(self, mock_config):
-        """Test that client requires API key."""
-        mock_config.api.polygon_api_key = ""
         
-        with pytest.raises(ValueError, match="Polygon API key is required"):
-            PolygonClient(mock_config)
+        assert client.config == mock_config
+        assert client.max_calls_per_minute == 5
+        assert client.min_delay_seconds == 13
+        assert client.rate_limit.calls_made == 0
+        assert client.client is not None
     
-    @patch('requests.Session.get')
-    def test_successful_request(self, mock_get, client):
-        """Test successful API request."""
-        # Mock successful response
+    def test_initialization_with_invalid_api_key(self, mock_config):
+        """Test initialization with invalid API key"""
+        with patch('src.trading_system.data_ingestion.polygon_client.RESTClient') as mock_client_class:
+            mock_client_class.side_effect = Exception("Invalid API key")
+            
+            with pytest.raises(PolygonAPIError, match="Client initialization failed"):
+                PolygonClient(mock_config)
+
+
+class TestRateLimiting:
+    """Test rate limiting functionality"""
+    
+    def test_rate_limit_tracking(self, polygon_client):
+        """Test rate limit tracking"""
+        # Initially no calls made
+        status = polygon_client.get_rate_limit_status()
+        assert status['calls_made'] == 0
+        assert status['calls_remaining'] == 5
+        
+        # Simulate calls
+        polygon_client.rate_limit.calls_made = 3
+        polygon_client.rate_limit.window_start = time.time()
+        
+        status = polygon_client.get_rate_limit_status()
+        assert status['calls_made'] == 3
+        assert status['calls_remaining'] == 2
+    
+    def test_rate_limit_window_reset(self, polygon_client):
+        """Test rate limit window reset after 60 seconds"""
+        # Set up rate limit state
+        polygon_client.rate_limit.calls_made = 5
+        polygon_client.rate_limit.window_start = time.time() - 61  # 61 seconds ago
+        
+        # Check rate limit should reset the window
+        polygon_client._check_rate_limit()
+        
+        assert polygon_client.rate_limit.calls_made == 0
+        assert polygon_client.rate_limit.window_start > time.time() - 1
+    
+    def test_minimum_delay_enforcement(self, polygon_client):
+        """Test minimum delay between calls"""
+        polygon_client.rate_limit.last_call_time = time.time()
+        
+        # Mock time.sleep to capture sleep calls
+        with patch('time.sleep') as mock_sleep:
+            polygon_client._check_rate_limit()
+            
+            # Should have slept for approximately min_delay_seconds
+            mock_sleep.assert_called_once()
+            sleep_time = mock_sleep.call_args[0][0]
+            assert 12 <= sleep_time <= 13  # Allow for small timing differences
+
+
+class TestAPICallHandling:
+    """Test API call handling with retries and error handling"""
+    
+    def test_successful_api_call(self, polygon_client):
+        """Test successful API call"""
+        mock_func = Mock(return_value="success")
+        
+        result = polygon_client._make_api_call(mock_func, "arg1", kwarg1="value1")
+        
+        assert result == "success"
+        mock_func.assert_called_once_with("arg1", kwarg1="value1")
+        assert polygon_client.rate_limit.calls_made == 1
+    
+    def test_api_call_with_retries(self, polygon_client):
+        """Test API call with retries on failure"""
+        mock_func = Mock(side_effect=[Exception("Network error"), Exception("Server error"), "success"])
+        
+        with patch('time.sleep'):  # Mock sleep to speed up test
+            result = polygon_client._make_api_call(mock_func)
+        
+        assert result == "success"
+        assert mock_func.call_count == 3
+        assert polygon_client.rate_limit.calls_made == 1  # Only successful calls count
+    
+    def test_api_call_max_retries_exceeded(self, polygon_client):
+        """Test API call when max retries exceeded"""
+        mock_func = Mock(side_effect=Exception("Persistent error"))
+        
+        with patch('time.sleep'):  # Mock sleep to speed up test
+            with pytest.raises(PolygonAPIError, match="API call failed after 3 attempts"):
+                polygon_client._make_api_call(mock_func)
+        
+        assert mock_func.call_count == 3
+
+
+class TestOptionsContracts:
+    """Test options contract retrieval"""
+    
+    def test_get_options_contracts_success(self, polygon_client, mock_polygon_rest_client):
+        """Test successful options contract retrieval"""
+        # Mock response data
+        mock_contract_data = Mock()
+        mock_contract_data.ticker = "O:AAPL240315C00150000"
+        mock_contract_data.underlying_ticker = "AAPL"
+        mock_contract_data.contract_type = "call"
+        mock_contract_data.expiration_date = "2024-03-15"
+        mock_contract_data.strike_price = 150.0
+        mock_contract_data.exercise_style = "american"
+        mock_contract_data.shares_per_contract = 100
+        mock_contract_data.primary_exchange = "NASDAQ"
+        mock_contract_data.created_at = "2024-01-01T00:00:00Z"
+        mock_contract_data.updated_at = "2024-01-01T00:00:00Z"
+        
         mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "OK",
-            "results": [{"test": "data"}],
-            "count": 1
-        }
-        mock_get.return_value = mock_response
+        mock_response.results = [mock_contract_data]
+        mock_polygon_rest_client.list_options_contracts.return_value = mock_response
         
-        # Make request
-        response = client._make_request("/test/endpoint", {"param": "value"})
+        with patch('time.sleep'):  # Mock sleep for rate limiting
+            contracts = polygon_client.get_options_contracts("AAPL")
         
-        # Verify response
-        assert response.status == "OK"
-        assert len(response.results) == 1
-        assert response.count == 1
-        
-        # Verify request was made correctly
-        mock_get.assert_called_once()
-        args, kwargs = mock_get.call_args
-        assert "apikey" in kwargs["params"]
-        assert kwargs["params"]["apikey"] == "test_api_key"
-        assert kwargs["params"]["param"] == "value"
-    
-    @patch('requests.Session.get')
-    def test_api_error_handling(self, mock_get, client):
-        """Test API error handling."""
-        # Mock error response
-        mock_response = Mock()
-        mock_response.status_code = 400
-        mock_response.json.return_value = {"error": "Bad request"}
-        mock_get.return_value = mock_response
-        
-        # Should raise PolygonAPIError
-        with pytest.raises(PolygonAPIError, match="API request failed with status 400"):
-            client._make_request("/test/endpoint")
-    
-    @patch('requests.Session.get')
-    def test_network_error_handling(self, mock_get, client):
-        """Test network error handling."""
-        # Mock network error
-        import requests
-        mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
-        
-        # Should raise PolygonAPIError
-        with pytest.raises(PolygonAPIError, match="Request failed"):
-            client._make_request("/test/endpoint")
-    
-    @patch('requests.Session.get')
-    def test_retry_mechanism(self, mock_get, client):
-        """Test retry mechanism for transient errors."""
-        # Mock responses: first two fail with 500, third succeeds
-        responses = [
-            Mock(status_code=500),
-            Mock(status_code=500),
-            Mock(status_code=200, **{'json.return_value': {"status": "OK", "results": []}})
-        ]
-        mock_get.side_effect = responses
-        
-        # Mock time.sleep to speed up test
-        with patch('time.sleep'):
-            response = client._make_request("/test/endpoint")
-        
-        # Should eventually succeed
-        assert response.status == "OK"
-        assert mock_get.call_count == 3
-    
-    @patch('requests.Session.get')
-    def test_get_stock_bars(self, mock_get, client):
-        """Test getting stock bars."""
-        # Mock API response
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "OK",
-            "results": [
-                {
-                    "t": 1642204800000,  # Timestamp in milliseconds
-                    "o": 150.0,
-                    "h": 155.0,
-                    "l": 149.0,
-                    "c": 154.0,
-                    "v": 1000000,
-                    "vw": 152.5
-                }
-            ]
-        }
-        mock_get.return_value = mock_response
-        
-        # Get stock bars
-        bars = client.get_stock_bars(
-            symbol="AAPL",
-            start_date=date(2022, 1, 15),
-            end_date=date(2022, 1, 15)
-        )
-        
-        # Verify results
-        assert len(bars) == 1
-        bar = bars[0]
-        assert isinstance(bar, OHLCVData)
-        assert bar.symbol == "AAPL"
-        assert bar.volume == 1000000
-    
-    @patch('requests.Session.get')
-    def test_get_news(self, mock_get, client):
-        """Test getting news articles."""
-        # Mock API response
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "OK",
-            "results": [
-                {
-                    "id": "test-123",
-                    "title": "Test News",
-                    "published_utc": "2022-01-15T12:00:00Z",
-                    "tickers": ["AAPL"],
-                    "keywords": ["earnings"]
-                }
-            ]
-        }
-        mock_get.return_value = mock_response
-        
-        # Get news
-        articles = client.get_news(symbol="AAPL", limit=10)
-        
-        # Verify results
-        assert len(articles) == 1
-        article = articles[0]
-        assert isinstance(article, NewsArticle)
-        assert article.id == "test-123"
-        assert article.title == "Test News"
-        assert "AAPL" in article.tickers
-    
-    @patch('requests.Session.get')
-    def test_get_options_contracts(self, mock_get, client):
-        """Test getting options contracts."""
-        # Mock API response
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "OK",
-            "results": [
-                {
-                    "ticker": "AAPL240119C00150000",
-                    "underlying_ticker": "AAPL",
-                    "strike_price": 150.0,
-                    "expiration_date": "2024-01-19",
-                    "contract_type": "call"
-                }
-            ]
-        }
-        mock_get.return_value = mock_response
-        
-        # Get options contracts
-        contracts = client.get_options_contracts(underlying_symbol="AAPL")
-        
-        # Verify results
         assert len(contracts) == 1
         contract = contracts[0]
         assert isinstance(contract, OptionsContract)
+        assert contract.ticker == "O:AAPL240315C00150000"
         assert contract.underlying_ticker == "AAPL"
-        assert contract.option_type == "call"
+        assert contract.contract_type == "call"
+        assert contract.strike_price == 150.0
     
-    @patch('requests.Session.get')
-    def test_get_technical_indicators(self, mock_get, client):
-        """Test getting technical indicators."""
-        # Mock API response
+    def test_get_options_contracts_with_filters(self, polygon_client, mock_polygon_rest_client):
+        """Test options contract retrieval with filters"""
         mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "OK",
-            "results": [
-                {
-                    "timestamp": 1642204800000,
-                    "value": 50.25
-                }
-            ]
-        }
-        mock_get.return_value = mock_response
+        mock_response.results = []
+        mock_polygon_rest_client.list_options_contracts.return_value = mock_response
         
-        # Get technical indicators
-        indicators = client.get_technical_indicators(
-            symbol="AAPL",
-            indicator_name="sma",
-            start_date=date(2022, 1, 15),
-            end_date=date(2022, 1, 15)
-        )
-        
-        # Verify results
-        assert len(indicators) == 1
-        indicator = indicators[0]
-        assert isinstance(indicator, TechnicalIndicator)
-        assert indicator.symbol == "AAPL"
-        assert indicator.indicator_name == "sma"
-        assert indicator.value == 50.25
-    
-    def test_health_check_success(self, client):
-        """Test successful health check."""
-        with patch.object(client, '_make_request') as mock_request:
-            mock_request.return_value = APIResponse(
-                status="OK",
-                results=[]
+        with patch('time.sleep'):
+            contracts = polygon_client.get_options_contracts(
+                underlying_ticker="AAPL",
+                expiration_date="2024-03-15",
+                contract_type="call",
+                strike_price_gte=140.0,
+                strike_price_lte=160.0
             )
-            
-            assert client.health_check() is True
-            mock_request.assert_called_once()
-    
-    def test_health_check_failure(self, client):
-        """Test failed health check."""
-        with patch.object(client, '_make_request') as mock_request:
-            mock_request.side_effect = PolygonAPIError("Connection failed")
-            
-            assert client.health_check() is False
-    
-    def test_rate_limit_info(self, client):
-        """Test getting rate limit info."""
-        info = client.get_rate_limit_info()
-        assert info.calls_per_minute == 5
-        assert info.calls_remaining <= 5
-
-
-@pytest.mark.skipif(not CLIENT_AVAILABLE, reason="Polygon client not available")
-class TestPolygonAPIError:
-    """Test Polygon API error class."""
-    
-    def test_basic_error(self):
-        """Test basic error creation."""
-        error = PolygonAPIError("Test error")
-        assert str(error) == "Test error"
-        assert error.status_code is None
-        assert error.response_data is None
-    
-    def test_error_with_details(self):
-        """Test error with status code and response data."""
-        error = PolygonAPIError(
-            "API error",
-            status_code=400,
-            response_data={"error": "bad request"}
+        
+        mock_polygon_rest_client.list_options_contracts.assert_called_once_with(
+            underlying_ticker="AAPL",
+            expiration_date="2024-03-15",
+            contract_type="call",
+            strike_price_gte=140.0,
+            strike_price_lte=160.0,
+            expired=False,
+            limit=1000
         )
-        assert str(error) == "API error"
-        assert error.status_code == 400
-        assert error.response_data["error"] == "bad request"
+        assert contracts == []
+    
+    def test_get_options_contracts_api_error(self, polygon_client, mock_polygon_rest_client):
+        """Test options contract retrieval with API error"""
+        mock_polygon_rest_client.list_options_contracts.side_effect = Exception("API Error")
+        
+        with patch('time.sleep'):
+            with pytest.raises(PolygonAPIError, match="Failed to get options contracts"):
+                polygon_client.get_options_contracts("AAPL")
+
+
+class TestOptionsBars:
+    """Test options bars retrieval"""
+    
+    def test_get_options_bars_success(self, polygon_client, mock_polygon_rest_client):
+        """Test successful options bars retrieval"""
+        # Mock bar data
+        mock_bar_data = Mock()
+        mock_bar_data.t = 1640995200000  # Unix timestamp in milliseconds
+        mock_bar_data.o = 10.50
+        mock_bar_data.h = 11.00
+        mock_bar_data.l = 10.25
+        mock_bar_data.c = 10.75
+        mock_bar_data.v = 1000
+        mock_bar_data.vw = 10.65
+        mock_bar_data.n = 50
+        
+        mock_response = Mock()
+        mock_response.results = [mock_bar_data]
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            bars = polygon_client.get_options_bars(
+                "O:AAPL240315C00150000",
+                TimeFrame.DAY,
+                "2024-01-01",
+                "2024-01-31"
+            )
+        
+        assert len(bars) == 1
+        bar = bars[0]
+        assert isinstance(bar, OptionsBar)
+        assert bar.ticker == "O:AAPL240315C00150000"
+        assert bar.timestamp == 1640995200000
+        assert bar.open == 10.50
+        assert bar.close == 10.75
+        assert bar.volume == 1000
+    
+    def test_get_options_bars_empty_response(self, polygon_client, mock_polygon_rest_client):
+        """Test options bars retrieval with empty response"""
+        mock_response = Mock()
+        mock_response.results = None
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            bars = polygon_client.get_options_bars(
+                "O:AAPL240315C00150000",
+                TimeFrame.DAY,
+                "2024-01-01",
+                "2024-01-31"
+            )
+        
+        assert bars == []
+
+
+class TestUnderlyingBars:
+    """Test underlying stock bars retrieval"""
+    
+    def test_get_underlying_bars_success(self, polygon_client, mock_polygon_rest_client):
+        """Test successful underlying bars retrieval"""
+        # Mock bar data
+        mock_bar_data = Mock()
+        mock_bar_data.t = 1640995200000
+        mock_bar_data.o = 150.50
+        mock_bar_data.h = 152.00
+        mock_bar_data.l = 149.25
+        mock_bar_data.c = 151.75
+        mock_bar_data.v = 1000000
+        mock_bar_data.vw = 151.25
+        mock_bar_data.n = 5000
+        
+        mock_response = Mock()
+        mock_response.results = [mock_bar_data]
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            df = polygon_client.get_underlying_bars(
+                "AAPL",
+                TimeFrame.DAY,
+                "2024-01-01",
+                "2024-01-31"
+            )
+        
+        assert len(df) == 1
+        assert 'open' in df.columns
+        assert 'close' in df.columns
+        assert 'volume' in df.columns
+        assert df.iloc[0]['open'] == 150.50
+        assert df.iloc[0]['close'] == 151.75
+    
+    def test_get_underlying_bars_empty_response(self, polygon_client, mock_polygon_rest_client):
+        """Test underlying bars retrieval with empty response"""
+        mock_response = Mock()
+        mock_response.results = None
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            df = polygon_client.get_underlying_bars(
+                "AAPL",
+                TimeFrame.DAY,
+                "2024-01-01",
+                "2024-01-31"
+            )
+        
+        assert df.empty
+
+
+class TestMarketStatus:
+    """Test market status functionality"""
+    
+    def test_get_market_status_success(self, polygon_client, mock_polygon_rest_client):
+        """Test successful market status retrieval"""
+        mock_exchange_data = Mock()
+        mock_exchange_data.status = "open"
+        mock_exchange_data.session = "regular"
+        
+        mock_response = Mock()
+        mock_response.market = "open"
+        mock_response.serverTime = "2024-01-01T15:30:00Z"
+        mock_response.exchanges = {"NASDAQ": mock_exchange_data}
+        
+        mock_polygon_rest_client.get_market_status.return_value = mock_response
+        
+        with patch('time.sleep'):
+            status = polygon_client.get_market_status()
+        
+        assert status['market'] == 'open'
+        assert status['server_time'] == '2024-01-01T15:30:00Z'
+        assert 'NASDAQ' in status['exchanges']
+        assert status['exchanges']['NASDAQ']['status'] == 'open'
+    
+    def test_get_market_status_api_error(self, polygon_client, mock_polygon_rest_client):
+        """Test market status retrieval with API error"""
+        mock_polygon_rest_client.get_market_status.side_effect = Exception("API Error")
+        
+        with patch('time.sleep'):
+            with pytest.raises(PolygonAPIError, match="Failed to get market status"):
+                polygon_client.get_market_status()
+
+
+class TestTickerValidation:
+    """Test ticker validation functionality"""
+    
+    def test_validate_ticker_success(self, polygon_client, mock_polygon_rest_client):
+        """Test successful ticker validation"""
+        mock_response = Mock()
+        mock_response.results = [Mock()]  # Non-empty results indicate valid ticker
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            is_valid = polygon_client.validate_ticker("AAPL")
+        
+        assert is_valid is True
+    
+    def test_validate_ticker_invalid(self, polygon_client, mock_polygon_rest_client):
+        """Test ticker validation for invalid ticker"""
+        mock_response = Mock()
+        mock_response.results = None  # Empty results indicate invalid ticker
+        mock_polygon_rest_client.get_aggs.return_value = mock_response
+        
+        with patch('time.sleep'):
+            is_valid = polygon_client.validate_ticker("INVALID")
+        
+        assert is_valid is False
+    
+    def test_validate_ticker_api_error(self, polygon_client, mock_polygon_rest_client):
+        """Test ticker validation with API error"""
+        mock_polygon_rest_client.get_aggs.side_effect = Exception("API Error")
+        
+        with patch('time.sleep'):
+            is_valid = polygon_client.validate_ticker("AAPL")
+        
+        assert is_valid is False
+
+
+class TestDataClasses:
+    """Test data class functionality"""
+    
+    def test_options_contract_creation(self):
+        """Test OptionsContract data class creation"""
+        contract = OptionsContract(
+            ticker="O:AAPL240315C00150000",
+            underlying_ticker="AAPL",
+            contract_type="call",
+            expiration_date="2024-03-15",
+            strike_price=150.0,
+            exercise_style="american",
+            shares_per_contract=100,
+            primary_exchange="NASDAQ"
+        )
+        
+        assert contract.ticker == "O:AAPL240315C00150000"
+        assert contract.underlying_ticker == "AAPL"
+        assert contract.contract_type == "call"
+        assert contract.strike_price == 150.0
+    
+    def test_options_bar_creation(self):
+        """Test OptionsBar data class creation"""
+        bar = OptionsBar(
+            ticker="O:AAPL240315C00150000",
+            timestamp=1640995200000,
+            open=10.50,
+            high=11.00,
+            low=10.25,
+            close=10.75,
+            volume=1000,
+            vwap=10.65,
+            transactions=50
+        )
+        
+        assert bar.ticker == "O:AAPL240315C00150000"
+        assert bar.timestamp == 1640995200000
+        assert bar.open == 10.50
+        assert bar.volume == 1000
+    
+    def test_rate_limit_info_creation(self):
+        """Test RateLimitInfo data class creation"""
+        info = RateLimitInfo(
+            calls_made=3,
+            window_start=time.time(),
+            last_call_time=time.time()
+        )
+        
+        assert info.calls_made == 3
+        assert info.window_start > 0
+        assert info.last_call_time > 0
+
+
+class TestEnums:
+    """Test enum functionality"""
+    
+    def test_data_type_enum(self):
+        """Test DataType enum values"""
+        assert DataType.TRADES.value == "trades"
+        assert DataType.QUOTES.value == "quotes"
+        assert DataType.BARS.value == "bars"
+        assert DataType.OPTIONS_CONTRACTS.value == "options_contracts"
+        assert DataType.DAILY_BARS.value == "daily_bars"
+    
+    def test_time_frame_enum(self):
+        """Test TimeFrame enum values"""
+        assert TimeFrame.MINUTE.value == "minute"
+        assert TimeFrame.HOUR.value == "hour"
+        assert TimeFrame.DAY.value == "day"
+        assert TimeFrame.WEEK.value == "week"
+        assert TimeFrame.MONTH.value == "month"
 
 
 if __name__ == "__main__":
